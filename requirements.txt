@@ -1,0 +1,274 @@
+using Godot;
+using System;
+using System.Text;
+using System.Collections.Generic;
+using System.Text.Json;
+
+public partial class VoxelEngine : Node3D
+{
+    [Export] public PackedScene PlayerAvatarScene;
+
+    public Dictionary<Vector3I, MeshInstance3D> WorldBlocks = new Dictionary<Vector3I, MeshInstance3D>();
+    public List<CustomBlockData> CustomBuildBlocks = new List<CustomBlockData>();
+    public Dictionary<string, List<CustomBlockData>> CommunityGames = new Dictionary<string, List<CustomBlockData>>();
+
+    public NetworkSync NetSync { get; private set; }
+    public GlobalSocialManager SocialManager { get; private set; }
+    public NetworkManager NetManager { get; private set; }
+    public GameLauncher Launcher { get; private set; }
+    public MapPersistence Persistence { get; private set; }
+    public VirtualJoystick Joystick { get; private set; }
+    public TradeUI TradePanel { get; private set; }
+    public ItemShopUI ShopPanel { get; private set; }
+    public GameHubUI HubPanel { get; private set; }
+    public AuthUI LoginPanel { get; private set; }
+    public GameCreatorUI CreatorPanel { get; private set; }
+
+    private Label _uiWalletDisplay;
+    private Label _uiActiveGameLabel;
+    private Node3D _activeGameContainer;
+    private Timer _gameLoopTimer;
+    private string _currentMode = "Sandbox";
+    private int _modeTickCount = 0;
+
+    public class CustomBlockData
+    {
+        public float X { get; set; }
+        public float Y { get; set; }
+        public float Z { get; set; }
+        public string HexColor { get; set; } = "33cc55";
+        public bool IsGoal { get; set; } = false;
+    }
+
+    public override void _Ready()
+    {
+        // 1. Setup UI Layer & Sleek Wallet HUD with Matching Claw-Blade Medallion
+        CanvasLayer uiLayer = new CanvasLayer { Name = "UI" };
+
+        PanelContainer walletPill = new PanelContainer { Position = new Vector2(20, 20) };
+        StyleBoxFlat pillStyle = new StyleBoxFlat
+        {
+            BgColor = new Color(0.08f, 0.09f, 0.12f, 0.90f),
+            CornerRadiusTopLeft = 10,
+            CornerRadiusTopRight = 10,
+            CornerRadiusBottomLeft = 10,
+            CornerRadiusBottomRight = 10,
+            ContentMarginLeft = 14,
+            ContentMarginRight = 16,
+            ContentMarginTop = 6,
+            ContentMarginBottom = 6
+        };
+        walletPill.AddThemeStyleboxOverride("panel", pillStyle);
+
+        HBoxContainer walletRow = new HBoxContainer();
+        walletRow.AddThemeConstantOverride("separation", 10);
+
+        CoinLogoBadge coinIcon = new CoinLogoBadge { CustomMinimumSize = new Vector2(32, 32) };
+        walletRow.AddChild(coinIcon);
+
+        _uiWalletDisplay = new Label { Text = "Guest  |  0" };
+        _uiWalletDisplay.AddThemeColorOverride("font_color", new Color(1.0f, 0.88f, 0.35f));
+        walletRow.AddChild(_uiWalletDisplay);
+
+        _uiActiveGameLabel = new Label { Text = "  [Mode: Sandbox]" };
+        _uiActiveGameLabel.AddThemeColorOverride("font_color", new Color(0.55f, 0.85f, 1.0f));
+        walletRow.AddChild(_uiActiveGameLabel);
+
+        walletPill.AddChild(walletRow);
+        uiLayer.AddChild(walletPill);
+
+        // 2. Attach Subsystems
+        NetSync = new NetworkSync { Name = "NetworkSync" };
+        AddChild(NetSync);
+
+        SocialManager = new GlobalSocialManager { Name = "GlobalSocialManager" };
+        AddChild(SocialManager);
+
+        NetManager = new NetworkManager { Name = "NetworkManager", PlayerAvatarScene = PlayerAvatarScene };
+        AddChild(NetManager);
+
+        Launcher = new GameLauncher { Name = "GameLauncher" };
+        AddChild(Launcher);
+
+        Persistence = new MapPersistence { Name = "MapPersistence" };
+        AddChild(Persistence);
+
+        // 3. Attach UI Panels
+        HubPanel = new GameHubUI(this) { Name = "GameHubUI" };
+        uiLayer.AddChild(HubPanel);
+
+        CreatorPanel = new GameCreatorUI(this) { Name = "GameCreatorUI", Visible = false };
+        uiLayer.AddChild(CreatorPanel);
+
+        Joystick = new VirtualJoystick { Name = "VirtualJoystick" };
+        uiLayer.AddChild(Joystick);
+
+        ShopPanel = new ItemShopUI { Name = "ItemShopUI", Visible = false };
+        uiLayer.AddChild(ShopPanel);
+
+        TradePanel = new TradeUI { Name = "TradeUI", Visible = false };
+        uiLayer.AddChild(TradePanel);
+
+        LoginPanel = new AuthUI(NetSync) { Name = "AuthUI" };
+        uiLayer.AddChild(LoginPanel);
+
+        AddChild(uiLayer);
+
+        // 4. Dynamic Experience Container & Game Loop Timer
+        _activeGameContainer = new Node3D { Name = "ActiveGameWorld" };
+        AddChild(_activeGameContainer);
+
+        _gameLoopTimer = new Timer { WaitTime = 2.5f, Autostart = true };
+        _gameLoopTimer.Timeout += OnGameModeTick;
+        AddChild(_gameLoopTimer);
+
+        LoadExperience("Sandbox");
+        NetSync.FetchCommunityGames();
+    }
+
+    public void LoadExperience(string modeName)
+    {
+        _currentMode = modeName;
+        _modeTickCount = 0;
+        _uiActiveGameLabel.Text = $"  [Mode: {modeName}]";
+
+        foreach (Node child in _activeGameContainer.GetChildren())
+        {
+            child.QueueFree();
+        }
+        WorldBlocks.Clear();
+
+        if (CommunityGames.ContainsKey(modeName))
+        {
+            foreach (var b in CommunityGames[modeName])
+            {
+                SpawnBlock(new Vector3(b.X, b.Y, b.Z), new Vector3(2, 0.8f, 2), Color.FromHtml(b.HexColor), b.IsGoal, 25);
+            }
+            ResetPlayerPosition();
+            return;
+        }
+
+        switch (modeName)
+        {
+            case "Sandbox":
+            case "Voxel Sandbox":
+                BuildVoxelTerrain(16, 4, 16, new Color(0.28f, 0.72f, 0.35f));
+                break;
+            case "Creator Studio":
+                CustomBuildBlocks.Clear();
+                SpawnBlock(new Vector3(8, 2, 8), new Vector3(6, 1, 6), new Color(0.25f, 0.28f, 0.35f));
+                break;
+            case "Mega Sky Obby":
+                BuildObbyCourse();
+                break;
+            case "Coin Rush Simulator":
+                BuildVoxelTerrain(20, 1, 20, new Color(0.22f, 0.25f, 0.32f));
+                SpawnCoinPickups(20);
+                break;
+            case "Natural Disaster Survival":
+                BuildVoxelTerrain(14, 2, 14, new Color(0.85f, 0.35f, 0.25f));
+                break;
+            case "Miner's Coin Tycoon":
+                BuildTycoonFactory();
+                break;
+            case "Sword Fight Heights":
+                BuildSwordFightIslands();
+                break;
+            case "Color Block Party":
+                BuildColorPartyGrid();
+                break;
+            case "Speed Run 4":
+                BuildSpeedRunTrack();
+                break;
+            case "Zombie Survival Wave":
+                BuildVoxelTerrain(18, 1, 18, new Color(0.18f, 0.28f, 0.18f));
+                SpawnZombieWave(6);
+                break;
+            case "Laser Tag Arena":
+                BuildLaserTagArena();
+                break;
+            case "Roleplay Town":
+                BuildRoleplayTown();
+                break;
+            case "Fishing Simulator":
+                BuildFishingLake();
+                break;
+        }
+
+        ResetPlayerPosition();
+    }
+
+    private void ResetPlayerPosition()
+    {
+        var player = GetNodeOrNull<CharacterBody3D>("1");
+        if (player != null) player.Position = new Vector3(8, 8, 8);
+    }
+
+    public void PlaceCreatorBlock(Vector3 pos, string hexColor, bool isGoal)
+    {
+        CustomBlockData data = new CustomBlockData
+        {
+            X = Mathf.Round(pos.X),
+            Y = Mathf.Round(pos.Y),
+            Z = Mathf.Round(pos.Z),
+            HexColor = hexColor,
+            IsGoal = isGoal
+        };
+        CustomBuildBlocks.Add(data);
+        SpawnBlock(new Vector3(data.X, data.Y, data.Z), new Vector3(2, 0.8f, 2), Color.FromHtml(hexColor), isGoal, 25);
+    }
+
+    private void SpawnBlock(Vector3 pos, Vector3 size, Color color, bool isRewardPad = false, int rewardAmount = 25)
+    {
+        StaticBody3D body = new StaticBody3D { Position = pos };
+        BoxMesh mesh = new BoxMesh { Size = size };
+        StandardMaterial3D mat = new StandardMaterial3D { AlbedoColor = color };
+        if (isRewardPad)
+        {
+            mat.EmissionEnabled = true;
+            mat.Emission = color;
+        }
+
+        MeshInstance3D inst = new MeshInstance3D { Mesh = mesh, MaterialOverride = mat };
+        CollisionShape3D col = new CollisionShape3D { Shape = new BoxShape3D { Size = size } };
+
+        body.AddChild(inst);
+        body.AddChild(col);
+        _activeGameContainer.AddChild(body);
+        WorldBlocks[new Vector3I((int)pos.X, (int)pos.Y, (int)pos.Z)] = inst;
+
+        if (isRewardPad)
+        {
+            Area3D trigger = new Area3D();
+            CollisionShape3D trigCol = new CollisionShape3D { Shape = new BoxShape3D { Size = size + new Vector3(0.2f, 1.5f, 0.2f) } };
+            trigger.AddChild(trigCol);
+            trigger.BodyEntered += (Node3D b) =>
+            {
+                if (b is CharacterBody3D)
+                {
+                    SocialManager?.SendEarnCoins(rewardAmount);
+                    LoadExperience("Sandbox");
+                }
+            };
+            body.AddChild(trigger);
+        }
+    }
+
+    private void BuildVoxelTerrain(int width, int height, int depth, Color topColor)
+    {
+        for (int x = 0; x < width; x++)
+        {
+            for (int y = 0; y < height; y++)
+            {
+                for (int z = 0; z < depth; z++)
+                {
+                    Color c = (y == height - 1) ? topColor : new Color(0.45f, 0.35f, 0.28f);
+                    SpawnBlock(new Vector3(x, y, z), Vector3.One, c);
+                }
+            }
+        }
+    }
+
+    private void BuildObbyCourse()
+    {
+        SpawnBlock(new Vector3(8, 3, 8), new Vector3(5, 1, 5), new Color(0.2f, 0.6f, 1.0f));
